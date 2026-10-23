@@ -115,7 +115,9 @@ static void jsToDynamicValue (JSContext* ctx, JSValue val, DynamicValue& source)
     int tag = JS_VALUE_GET_TAG (val);
 
     if (tag == JS_TAG_UNDEFINED || tag == JS_TAG_UNINITIALIZED || tag == JS_TAG_NULL) {
-	source.update (DynamicValue::UpdateSource::Script);
+	// WE `update()` often assigns `thisLayer.visible` and returns nothing.
+	// Treating undefined as "set null" cleared the April-fly flag to empty
+	// and left the image reading a stale `true`.
 	return;
     }
 
@@ -126,6 +128,7 @@ static void jsToDynamicValue (JSContext* ctx, JSValue val, DynamicValue& source)
 
     if (tag == JS_TAG_BOOL) {
 	source.update (static_cast<bool> (JS_VALUE_GET_BOOL (val)), DynamicValue::UpdateSource::Script);
+	return;
     }
 
     if (JS_TAG_IS_FLOAT64 (tag)) {
@@ -174,6 +177,10 @@ static void jsToDynamicValue (JSContext* ctx, JSValue val, DynamicValue& source)
 
 	source.update (glm::vec4 (xVal, yVal, zVal, wVal), DynamicValue::UpdateSource::Script);
     }
+}
+
+void ScriptEngine::assignFromJs (DynamicValue& target, JSValue val) {
+    jsToDynamicValue (this->m_context, val, target);
 }
 
 ScriptEngine::ScriptEngine (Wallpapers::CScene& scene, Media::MediaSource& mediaSource) :
@@ -578,7 +585,23 @@ void ScriptEngine::queueScript (const std::string& key, DynamicValue& currentVal
     }
 
     // load the script and store it
-    JSValue module = JS_Eval (this->m_context, source->c_str (), source->size (), key.c_str (), JS_EVAL_TYPE_MODULE);
+    // Same export/'use strict' strip as createLayerScript: QuickJS module
+    // objects do not expose `update` via JS_GetPropertyStr, so the April-fly
+    // script never ran and `thisLayer.visible = false` was a no-op.
+    std::string body = *source;
+    size_t pos;
+    while ((pos = body.find ("'use strict';")) != std::string::npos) {
+	body.erase (pos, 13);
+    }
+    while ((pos = body.find ("\"use strict\";")) != std::string::npos) {
+	body.erase (pos, 13);
+    }
+    while ((pos = body.find ("export ")) != std::string::npos) {
+	body.erase (pos, 7);
+    }
+    body = "(function(){\n" + body
+	+ "\nreturn { update: (typeof update === 'function') ? update : null };\n})();";
+    JSValue module = JS_Eval (this->m_context, body.c_str (), body.size (), key.c_str (), JS_EVAL_TYPE_GLOBAL);
 
     auto inserted = this->m_scriptModules.emplace (
 	key,

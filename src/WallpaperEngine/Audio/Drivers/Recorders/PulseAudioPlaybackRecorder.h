@@ -16,8 +16,8 @@ public:
      */
     struct PulseAudioData {
 	kiss_fftr_cfg kisscfg;
-	uint8_t* audioBuffer;
-	uint8_t* audioBufferTmp;
+	float* audioBuffer;
+	float* audioBufferTmp;
 	size_t currentWritePointer;
 	bool fullFrameReady;
 	pa_stream* captureStream;

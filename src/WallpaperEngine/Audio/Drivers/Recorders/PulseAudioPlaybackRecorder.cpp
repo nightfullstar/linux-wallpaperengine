@@ -1,5 +1,6 @@
 #include "PulseAudioPlaybackRecorder.h"
 #include "WallpaperEngine/Logging/Log.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <glm/common.hpp>
@@ -50,31 +51,33 @@ void pa_stream_read_cb (pa_stream* stream, const size_t /*nbytes*/, void* userda
 	    return;
 	}
     } else if (currentSize > 0 && data) {
-	const size_t dataToCopy = std::min (currentSize, WAVE_BUFFER_SIZE - recorder->currentWritePointer);
-
-	// depending on the amount of data available, we might want to read one or multiple frames
-	const size_t end = recorder->currentWritePointer + dataToCopy;
+	const auto* samples = reinterpret_cast<const float*> (data);
+	const size_t incoming = currentSize / sizeof (float);
+	const size_t samplesToCopy = std::min (incoming, WAVE_BUFFER_SIZE - recorder->currentWritePointer);
+	const size_t end = recorder->currentWritePointer + samplesToCopy;
 
 	// this packet will fill the buffer, perform some extra checks for extra full buffers and get the latest one
 	if (end == WAVE_BUFFER_SIZE) {
-	    if (const size_t numberOfFullBuffers = (currentSize - dataToCopy) / WAVE_BUFFER_SIZE;
+	    if (const size_t numberOfFullBuffers = (incoming - samplesToCopy) / WAVE_BUFFER_SIZE;
 		numberOfFullBuffers > 0) {
 		// calculate the start of the last block (we need the end of the previous block, hence the - 1)
 		const size_t startOfLastBuffer = std::max (
-		    dataToCopy + (numberOfFullBuffers - 1) * WAVE_BUFFER_SIZE, currentSize - WAVE_BUFFER_SIZE
+		    samplesToCopy + (numberOfFullBuffers - 1) * WAVE_BUFFER_SIZE, incoming - WAVE_BUFFER_SIZE
 		);
 		// copy directly into the final buffer
-		memcpy (recorder->audioBuffer, &data[startOfLastBuffer], WAVE_BUFFER_SIZE * sizeof (uint8_t));
+		memcpy (recorder->audioBuffer, &samples[startOfLastBuffer], WAVE_BUFFER_SIZE * sizeof (float));
 		// copy whatever is left to the read/write buffer
-		recorder->currentWritePointer = currentSize - startOfLastBuffer - WAVE_BUFFER_SIZE;
+		recorder->currentWritePointer = incoming - startOfLastBuffer - WAVE_BUFFER_SIZE;
 		memcpy (
-		    recorder->audioBufferTmp, &data[startOfLastBuffer + WAVE_BUFFER_SIZE],
-		    recorder->currentWritePointer * sizeof (uint8_t)
+		    recorder->audioBufferTmp, &samples[startOfLastBuffer + WAVE_BUFFER_SIZE],
+		    recorder->currentWritePointer * sizeof (float)
 		);
 	    } else {
 		// okay, no full extra packets available, copy the rest of the data and flip the buffers
-		memcpy (&recorder->audioBufferTmp[recorder->currentWritePointer], data, dataToCopy * sizeof (uint8_t));
-		uint8_t* tmp = recorder->audioBuffer;
+		memcpy (
+		    &recorder->audioBufferTmp[recorder->currentWritePointer], samples, samplesToCopy * sizeof (float)
+		);
+		float* tmp = recorder->audioBuffer;
 		recorder->audioBuffer = recorder->audioBufferTmp;
 		recorder->audioBufferTmp = tmp;
 		// reset write pointer
@@ -85,8 +88,10 @@ void pa_stream_read_cb (pa_stream* stream, const size_t /*nbytes*/, void* userda
 	    recorder->fullFrameReady = true;
 	} else {
 	    // copy over available data to the tmp buffer and everything should be set
-	    memcpy (&recorder->audioBufferTmp[recorder->currentWritePointer], data, dataToCopy * sizeof (uint8_t));
-	    recorder->currentWritePointer += dataToCopy;
+	    memcpy (
+		&recorder->audioBufferTmp[recorder->currentWritePointer], samples, samplesToCopy * sizeof (float)
+	    );
+	    recorder->currentWritePointer += samplesToCopy;
 	}
     }
 
@@ -103,7 +108,7 @@ void pa_server_info_cb (pa_context* ctx, const pa_server_info* info, void* userd
     auto* recorder = static_cast<PulseAudioPlaybackRecorder::PulseAudioData*> (userdata);
 
     pa_sample_spec spec;
-    spec.format = PA_SAMPLE_U8;
+    spec.format = PA_SAMPLE_FLOAT32LE;
     spec.rate = 44100;
     spec.channels = 1;
 
@@ -177,8 +182,8 @@ void pa_context_notify_cb (pa_context* ctx, void* userdata) {
 PulseAudioPlaybackRecorder::PulseAudioPlaybackRecorder () :
     m_captureData (
 	{ .kisscfg = kiss_fftr_alloc (WAVE_BUFFER_SIZE, 0, nullptr, nullptr),
-	  .audioBuffer = new uint8_t[WAVE_BUFFER_SIZE],
-	  .audioBufferTmp = new uint8_t[WAVE_BUFFER_SIZE] }
+	  .audioBuffer = new float[WAVE_BUFFER_SIZE],
+	  .audioBufferTmp = new float[WAVE_BUFFER_SIZE] }
     ) {
     this->m_mainloop = pa_mainloop_new ();
     this->m_mainloopApi = pa_mainloop_get_api (this->m_mainloop);
@@ -233,9 +238,23 @@ void PulseAudioPlaybackRecorder::update () {
 
     this->m_captureData.fullFrameReady = false;
 
-    // convert audio data to deltas so the fft library can properly handle it
+    // analog 3.5mm often applies volume in hardware, so the Pulse monitor is
+    // ~0.003 while Bluetooth (software volume) is loud. Keep the waveform
+    // (float capture, not U8) and boost quiet windows so bass bands still move.
+    float peak = 0.0f;
     for (int i = 0; i < WAVE_BUFFER_SIZE; i++) {
-	this->m_audioFFTbuffer[i] = (this->m_captureData.audioBuffer[i] - 128) / 128.0f;
+	const float sample = this->m_captureData.audioBuffer[i];
+	this->m_audioFFTbuffer[i] = sample;
+	peak = std::max (peak, std::abs (sample));
+    }
+    // Analog 3.5mm often applies volume in hardware, so the Pulse monitor is
+    // ~0.003 while Bluetooth (software volume) is loud. Boost quiet captures
+    // so bass bands still move; leave silence and already-loud windows alone.
+    if (peak > 1.0e-4f && peak < 0.25f) {
+	const float gain = 0.8f / peak;
+	for (int i = 0; i < WAVE_BUFFER_SIZE; i++) {
+	    this->m_audioFFTbuffer[i] *= gain;
+	}
     }
 
     // perform full fft pass

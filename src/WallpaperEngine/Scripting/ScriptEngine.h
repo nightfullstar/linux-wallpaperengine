@@ -65,6 +65,7 @@ public:
     JSValue getGlobalThis () const { return m_globalThis; }
     LoadedModule* getRunningModule () const { return m_runningModule; }
     JSValue dynamicToJs (DynamicValue& value) const;
+    void assignFromJs (DynamicValue& target, JSValue val);
 
     /**
      * Evaluate a WallpaperEngine script's update() function.

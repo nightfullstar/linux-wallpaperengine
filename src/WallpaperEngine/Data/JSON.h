@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "WallpaperEngine/Data/Builders/UserSettingBuilder.h"
@@ -66,6 +67,13 @@ public:
 	    sLog.exception (message, ". Contents: ", base.dump ());
 	}
 
+	if constexpr (is_numeric_v<T>) {
+	    if (const auto coerced = tryCoerceNumber<T> (*it); coerced.has_value ()) {
+		return *coerced;
+	    }
+	    sLog.exception (message, ". Contents: ", base.dump ());
+	}
+
 	return (*it);
     }
     [[nodiscard]] std::optional<base_type> optional (const std::string& key) const noexcept {
@@ -87,7 +95,15 @@ public:
 	    return std::nullopt;
 	}
 
-	return *it;
+	if constexpr (is_numeric_v<T>) {
+	    return tryCoerceNumber<T> (*it);
+	}
+
+	try {
+	    return static_cast<T> (*it);
+	} catch (...) {
+	    return std::nullopt;
+	}
     }
     template <typename T> [[nodiscard]] T optional (const std::string& key, T defaultValue) const noexcept {
 	auto base = this->base ();
@@ -97,7 +113,15 @@ public:
 	    return defaultValue;
 	}
 
-	return (*it);
+	if constexpr (is_numeric_v<T>) {
+	    return tryCoerceNumber<T> (*it).value_or (defaultValue);
+	}
+
+	try {
+	    return static_cast<T> (*it);
+	} catch (...) {
+	    return defaultValue;
+	}
     }
     [[nodiscard]] UserSettingUniquePtr user (const std::string& key, const Properties& properties) const;
     template <typename T>
@@ -140,6 +164,36 @@ public:
     }
 
 private:
+    template <typename T>
+    static constexpr bool is_numeric_v = std::is_arithmetic_v<T> && !std::is_same_v<T, bool>;
+
+    /**
+     * Workshop scenes sometimes store numeric fields as strings
+     * (e.g. text padding "32.00000 32.00000"). Accept a leading number.
+     */
+    template <typename T> static std::optional<T> tryCoerceNumber (const base_type& value) noexcept {
+	if (value.is_number ()) {
+	    return value.template get<T> ();
+	}
+
+	if (!value.is_string ()) {
+	    return std::nullopt;
+	}
+
+	try {
+	    std::size_t parsed = 0;
+	    const double number = std::stod (value.template get<std::string> (), &parsed);
+
+	    if (parsed == 0) {
+		return std::nullopt;
+	    }
+
+	    return static_cast<T> (number);
+	} catch (...) {
+	    return std::nullopt;
+	}
+    }
+
     /**
      * @return The base json object to be used by the extension methods
      */

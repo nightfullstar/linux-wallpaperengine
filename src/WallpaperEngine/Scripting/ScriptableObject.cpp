@@ -13,7 +13,9 @@ ScriptableObject::ScriptableObject (Wallpapers::CScene& scene, const Object& obj
     this->registerProperty ("origin", *object.origin->value);
     this->registerProperty ("scale", *object.groupScale->value);
     this->registerProperty ("angles", *object.groupAngles->value);
-    this->registerProperty ("visible", *object.groupVisible->value);
+    // Do not register groupVisible here: CImage/CText/CParticle bind their
+    // own `visible` (the one with the workshop script). Registering first
+    // made thisLayer.visible write a different DynamicValue than render().
 }
 
 DynamicValue& ScriptableObject::getProperty (const std::string& name) {

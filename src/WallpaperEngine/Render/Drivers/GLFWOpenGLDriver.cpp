@@ -40,7 +40,7 @@ GLFWOpenGLDriver::GLFWOpenGLDriver (const char* windowTitle, ApplicationContext&
     if (context.settings.render.mode == Application::ApplicationContext::EXPLICIT_WINDOW) {
 	glfwWindowHint (GLFW_RESIZABLE, GLFW_FALSE);
 	glfwWindowHint (GLFW_DECORATED, GLFW_FALSE);
-	glfwWindowHint (GLFW_FLOATING, GLFW_TRUE);
+	glfwWindowHint (GLFW_FLOATING, GLFW_FALSE);
     }
 
 #if !NDEBUG

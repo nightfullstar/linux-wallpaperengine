@@ -62,11 +62,23 @@ int scriptableobject_property_set (
 	return -1;
     }
 
-    return 0;
+    ScopeGuard guard ([=] { JS_FreeCString (ctx, name); });
+
+    try {
+	auto& property = container->object.getProperty (name);
+	container->adapter.getEngine ().assignFromJs (property, val);
+	return 0;
+    } catch (const std::exception&) {
+	return -1;
+    }
 }
 
 ScriptableObjectAdapter::ScriptableObjectAdapter (ScriptEngine& engine, std::string name) :
     ObjectAdapter (engine), m_exoticMethods (), m_name (std::move (name)) {
+    this->m_exoticMethods = {
+	.get_property = scriptableobject_property_get,
+	.set_property = scriptableobject_property_set,
+    };
     this->registerType (
 	{
 	    .class_name = m_name.c_str (),

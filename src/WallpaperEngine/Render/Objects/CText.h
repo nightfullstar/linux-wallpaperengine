@@ -5,6 +5,7 @@
 
 #include <GL/glew.h>
 #include <glm/vec2.hpp>
+#include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
 #include "WallpaperEngine/Render/CObject.h"
@@ -23,6 +24,33 @@ class CScene;
 
 namespace WallpaperEngine::Render::Objects {
 using namespace WallpaperEngine::Data::Model;
+
+// Same scene-space origin as CImage: WE is Y-down, the scene FBO is Y-up.
+// CText used to use (origin.y - sceneH/2), which mirrored text off-screen
+// so white glyphs never landed on the bluescreen.
+inline glm::vec3 textSceneOrigin (const glm::vec3& origin, float sceneW, float sceneH) {
+    return {origin.x - sceneW * 0.5f, sceneH * 0.5f - origin.y, origin.z};
+}
+
+// Quad verts are centered on 0. WE origin is the aligned edge of the box:
+// left/center → shift +width/2 so the left edge sits on origin (Honest
+// Bluescreen Head). Applied in unscaled local space, after scale.
+inline glm::vec2 textAlignOffset (
+    const std::string& horizontal, const std::string& vertical, float quadW, float quadH
+) {
+    glm::vec2 out {0.0f, 0.0f};
+    if (horizontal == "left") {
+	out.x = quadW * 0.5f;
+    } else if (horizontal == "right") {
+	out.x = -quadW * 0.5f;
+    }
+    if (vertical == "top") {
+	out.y = -quadH * 0.5f;
+    } else if (vertical == "bottom") {
+	out.y = quadH * 0.5f;
+    }
+    return out;
+}
 
 /**
  * Phase 1 text renderer.

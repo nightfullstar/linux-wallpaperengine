@@ -1,5 +1,6 @@
 #include "CText.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <vector>
 
@@ -39,7 +40,8 @@ uniform mat4 uMVP;
 out vec2 vUV;
 void main() {
     vUV = aUV;
-    gl_Position = uMVP * vec4(aPos, 0.0, 1.0);
+    // z=-1 sits inside the ortho frustum (nearz 0.01); z=0 clips on some drivers
+    gl_Position = uMVP * vec4(aPos, -1.0, 1.0);
 }
 )glsl";
 
@@ -140,6 +142,10 @@ void CText::setup () {
     }
 
     m_valid = m_texture != 0 && m_program != 0 && m_vao != 0;
+    sLog.out (
+	"CText setup '", m_text.name, "' valid=", m_valid, " tex=", m_textureSize.x, "x", m_textureSize.y,
+	" font='", m_text.font, "'"
+    );
 }
 
 bool CText::initFreeType () {
@@ -205,11 +211,20 @@ unsigned int CText::computeEffectivePixelSize () const {
     // WE text objects often come with scale ~0.09 that, combined with a modest
     // pointsize, would rasterize glyphs to ~2px on screen (invisible). Rasterize
     // at higher resolution so that after the model scale is applied in render()
-    // the on-screen size matches the intended pointsize.
+    // the on-screen size matches the intended pointsize. The layout `size` box
+    // is NOT a font size — using it turned 12pt Small Text into 96px and
+    // crushed word spaces.
     const glm::vec3 initialScale = m_text.scale->value->getVec3 ();
     const float avgScale = (initialScale.x + initialScale.y) * 0.5f;
     const float compensate = (avgScale > 0.0f && avgScale < 1.0f) ? std::min (1.0f / avgScale, 32.0f) : 1.0f;
-    return std::max<unsigned int> (1u, static_cast<unsigned int> (m_text.pointSize->value->getFloat () * compensate));
+    const float sceneH = getScene ().getCamera ().getHeight ();
+    const float sceneScale = sceneH > 0.0f ? std::min (std::max (sceneH / 1080.0f, 1.0f), 2.0f) : 1.0f;
+    // WE `pointsize` is typographic points (1/72"). FT_Set_Pixel_Sizes wants
+    // pixels; 24pt at 96 DPI is 32px, which is what the official client draws
+    // on a 1080p display. Treating points as pixels made word spaces ~25% tight.
+    const float dpi = 96.0f / 72.0f;
+    const float desired = m_text.pointSize->value->getFloat () * dpi * compensate * sceneScale;
+    return std::max<unsigned int> (1u, static_cast<unsigned int> (desired));
 }
 
 void CText::initScriptLayer () {
@@ -228,55 +243,115 @@ void CText::initScriptLayer () {
     }
 }
 
-void CText::rebuildTextureFrom (const std::string& text) {
-    // Two-pass rasterization: first measure the bounding box, then rasterize
-    // every glyph into a single grayscale bitmap. Phase 1 renders one line —
-    // multi-line wrapping, alignment, and padding come with Phase 2.
-    //
-    // Safe to call repeatedly: GL handles (texture, VAO, VBO) are reused when
-    // already allocated, so dynamic/scripted text can regenerate the glyph
-    // bitmap every time the rendered string changes without leaking.
-    FT_GlyphSlot slot = m_ftFace->glyph;
-
-    int penX = 0;
-    int maxAscent = 0;
-    int maxDescent = 0;
-
-    for (unsigned char c : text) {
-	if (FT_Load_Char (m_ftFace, static_cast<FT_ULong> (c), FT_LOAD_RENDER) != 0) {
-	    continue;
+namespace {
+std::vector<FT_ULong> decodeUtf8 (const std::string& text) {
+    std::vector<FT_ULong> out;
+    out.reserve (text.size ());
+    for (size_t i = 0; i < text.size ();) {
+	const auto c = static_cast<unsigned char> (text[i]);
+	FT_ULong cp = c;
+	size_t n = 1;
+	if (c >= 0xF0 && i + 3 < text.size ()) {
+	    cp = static_cast<FT_ULong> ((c & 0x07) << 18) | static_cast<FT_ULong> ((text[i + 1] & 0x3F) << 12)
+		| static_cast<FT_ULong> ((text[i + 2] & 0x3F) << 6) | static_cast<FT_ULong> (text[i + 3] & 0x3F);
+	    n = 4;
+	} else if (c >= 0xE0 && i + 2 < text.size ()) {
+	    cp = static_cast<FT_ULong> ((c & 0x0F) << 12) | static_cast<FT_ULong> ((text[i + 1] & 0x3F) << 6)
+		| static_cast<FT_ULong> (text[i + 2] & 0x3F);
+	    n = 3;
+	} else if (c >= 0xC0 && i + 1 < text.size ()) {
+	    cp = static_cast<FT_ULong> ((c & 0x1F) << 6) | static_cast<FT_ULong> (text[i + 1] & 0x3F);
+	    n = 2;
 	}
-	penX += slot->advance.x >> 6;
-	maxAscent = std::max (maxAscent, slot->bitmap_top);
-	maxDescent = std::max (maxDescent, static_cast<int> (slot->bitmap.rows) - slot->bitmap_top);
+	out.push_back (cp);
+	i += n;
+    }
+    return out;
+}
+
+int glyphAdvance (FT_Face face, FT_GlyphSlot slot, FT_ULong cp, unsigned int pixelSize) {
+    if (FT_Load_Char (face, cp, FT_LOAD_RENDER) == 0 && (slot->advance.x >> 6) > 0) {
+	return slot->advance.x >> 6;
+    }
+    if (FT_Load_Char (face, cp, FT_LOAD_DEFAULT) == 0 && (slot->advance.x >> 6) > 0) {
+	return slot->advance.x >> 6;
+    }
+    if (cp == ' ' || cp == '\t' || cp == 0x00A0) {
+	const int fallback = static_cast<int> (std::max (1u, pixelSize / 3));
+	return std::max (slot->advance.x > 0 ? static_cast<int> (slot->advance.x >> 6) : 0, fallback);
+    }
+    return 0;
+}
+
+void blitGlyph (
+    std::vector<uint8_t>& pixels, int width, int height, const FT_GlyphSlot slot, int originX, int originY
+) {
+    const auto& bmp = slot->bitmap;
+    for (unsigned int row = 0; row < bmp.rows; ++row) {
+	for (unsigned int col = 0; col < bmp.width; ++col) {
+	    const int dstX = originX + static_cast<int> (col);
+	    const int dstY = originY + static_cast<int> (row);
+	    if (dstX < 0 || dstX >= width || dstY < 0 || dstY >= height) {
+		continue;
+	    }
+	    pixels[static_cast<size_t> (dstY) * width + dstX] = bmp.buffer[row * bmp.pitch + col];
+	}
+    }
+}
+} // namespace
+
+void CText::rebuildTextureFrom (const std::string& text) {
+    // Measure then rasterize. Split on U+000A so Honest Bluescreen's two-line
+    // joke is not smashed into one overflowing row (Phase 1 used to be 1-line).
+    FT_GlyphSlot slot = m_ftFace->glyph;
+    const auto cps = decodeUtf8 (text);
+
+    std::vector<std::vector<FT_ULong>> lines (1);
+    for (FT_ULong cp : cps) {
+	if (cp == '\n') {
+	    lines.emplace_back ();
+	} else {
+	    lines.back ().push_back (cp);
+	}
     }
 
-    const int width = std::max (1, penX);
-    const int height = std::max (1, maxAscent + maxDescent);
+    int maxAscent = 0;
+    int maxDescent = 0;
+    int maxWidth = 1;
+    std::vector<int> lineWidths;
+    lineWidths.reserve (lines.size ());
+    for (const auto& line : lines) {
+	int penX = 0;
+	for (FT_ULong cp : line) {
+	    const int adv = glyphAdvance (m_ftFace, slot, cp, m_lastPixelSize);
+	    if (adv <= 0 && slot->bitmap.rows == 0) {
+		continue;
+	    }
+	    penX += adv > 0 ? adv : (slot->advance.x >> 6);
+	    maxAscent = std::max (maxAscent, slot->bitmap_top);
+	    maxDescent = std::max (maxDescent, static_cast<int> (slot->bitmap.rows) - slot->bitmap_top);
+	}
+	lineWidths.push_back (penX);
+	maxWidth = std::max (maxWidth, penX);
+    }
+
+    const int lineHeight = std::max (1, maxAscent + maxDescent);
+    const int width = std::max (1, maxWidth);
+    const int height = std::max (1, lineHeight * static_cast<int> (lines.size ()));
     std::vector<uint8_t> pixels (static_cast<size_t> (width) * height, 0);
 
-    penX = 0;
-    for (unsigned char c : text) {
-	if (FT_Load_Char (m_ftFace, static_cast<FT_ULong> (c), FT_LOAD_RENDER) != 0) {
-	    continue;
-	}
-
-	const auto& bmp = slot->bitmap;
-	const int originX = penX + slot->bitmap_left;
-	const int originY = maxAscent - slot->bitmap_top;
-
-	for (unsigned int row = 0; row < bmp.rows; ++row) {
-	    for (unsigned int col = 0; col < bmp.width; ++col) {
-		const int dstX = originX + static_cast<int> (col);
-		const int dstY = originY + static_cast<int> (row);
-		if (dstX < 0 || dstX >= width || dstY < 0 || dstY >= height) {
-		    continue;
-		}
-		pixels[static_cast<size_t> (dstY) * width + dstX] = bmp.buffer[row * bmp.pitch + col];
+    for (size_t lineIndex = 0; lineIndex < lines.size (); ++lineIndex) {
+	int penX = 0;
+	const int lineTop = static_cast<int> (lineIndex) * lineHeight;
+	for (FT_ULong cp : lines[lineIndex]) {
+	    const int adv = glyphAdvance (m_ftFace, slot, cp, m_lastPixelSize);
+	    if (slot->bitmap.width > 0 && slot->bitmap.rows > 0) {
+		blitGlyph (
+		    pixels, width, height, slot, penX + slot->bitmap_left, lineTop + maxAscent - slot->bitmap_top
+		);
 	    }
+	    penX += adv > 0 ? adv : std::max (0, static_cast<int> (slot->advance.x >> 6));
 	}
-
-	penX += slot->advance.x >> 6;
     }
 
     const bool firstUpload = (m_texture == 0);
@@ -285,16 +360,47 @@ void CText::rebuildTextureFrom (const std::string& text) {
     }
     glBindTexture (GL_TEXTURE_2D, m_texture);
     glPixelStorei (GL_UNPACK_ALIGNMENT, 1);
-    glTexImage2D (GL_TEXTURE_2D, 0, GL_RED, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, pixels.data ());
+    // GL_R8 + swizzle: some 3.3 drivers sample a GL_RED texture as 0,0,0,1 so
+    // coverage never reaches the shader and white glyphs vanish.
+    glTexImage2D (GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, pixels.data ());
     if (firstUpload) {
 	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_RED);
+	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+	glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_RED);
     }
 
     m_textureSize = { width, height };
+    // `size` is a bounding box, not a stretch target. Stretching prose to that
+    // box (Big/Small Text 886×266 / 1670×201) fattened glyphs and hid word
+    // spaces. Only fill the box for sparse runs like Head "(    )" so the
+    // parens still wrap the eyes.
+    bool fillBox = false;
+    for (const auto& line : lines) {
+	int spaceRun = 0;
+	for (FT_ULong cp : line) {
+	    if (cp == ' ' || cp == 0x00A0) {
+		if (++spaceRun >= 3) {
+		    fillBox = true;
+		}
+	    } else {
+		spaceRun = 0;
+	    }
+	}
+    }
     m_quadSize = { static_cast<float> (width), static_cast<float> (height) };
+    if (fillBox) {
+	if (m_text.size.x > m_quadSize.x) {
+	    m_quadSize.x = m_text.size.x;
+	}
+	if (m_text.size.y > m_quadSize.y) {
+	    m_quadSize.y = m_text.size.y;
+	}
+    }
     m_lastRenderedText = text;
 
     uploadQuadVertices ();
@@ -407,27 +513,28 @@ void CText::render () {
     const glm::vec3 scale = m_text.scale->value->getVec3 ();
     const glm::vec3 origin = m_text.origin->value->getVec3 ();
 
-    // WE uses a Y-down coordinate system (origin at top-left, y increases downward).
-    // The final FBO is presented to screen with vflip=true on Wayland/GLFW, which maps
-    // GL y- to screen top and GL y+ to screen bottom. This effectively inverts Y again,
-    // so we need: gl_y = origin.y - scene_h/2  (not the CImage-style scene_h/2 - origin.y).
-    // CImage pre-compensates for X11 (no vflip) and gets corrected by the Wayland vflip.
-    // CText renders with direct vflip-aware coordinates.
+    // Same origin as CImage scene verts. The previous (origin.y - sceneH/2)
+    // path mirrored text off the bluescreen so white glyphs never showed.
     const float scene_w = getScene ().getCamera ().getWidth ();
     const float scene_h = getScene ().getCamera ().getHeight ();
-    const glm::vec3 gl_origin = {
-	origin.x - scene_w * 0.5f,
-	origin.y - scene_h * 0.5f,
-	origin.z,
-    };
+    const glm::vec3 gl_origin = textSceneOrigin (origin, scene_w, scene_h);
+
+    const glm::vec2 align = textAlignOffset (m_text.alignment, m_text.verticalalign, m_quadSize.x, m_quadSize.y);
 
     glm::mat4 model = glm::translate (glm::mat4 (1.0f), gl_origin);
     model = glm::scale (model, scale);
+    model = glm::translate (model, glm::vec3 (align, 0.0f));
 
     const glm::mat4 mvp = getScene ().getCamera ().getProjection () * getScene ().getCamera ().getLookAt () * model;
 
+    // Images leave their last-pass FBO bound. Draw onto the scene or glyphs vanish.
+    glBindFramebuffer (GL_FRAMEBUFFER, getScene ().getWallpaperFramebuffer ());
+    glViewport (0, 0, static_cast<GLsizei> (scene_w), static_cast<GLsizei> (scene_h));
+    glDisable (GL_DEPTH_TEST);
+    glDepthMask (GL_FALSE);
     glEnable (GL_BLEND);
     glBlendFunc (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColorMask (GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     glUseProgram (m_program);
     glUniformMatrix4fv (m_uMVP, 1, GL_FALSE, glm::value_ptr (mvp));

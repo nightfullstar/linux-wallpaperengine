@@ -1,9 +1,31 @@
 #include "DynamicValueParser.h"
 
 #include "UserSettingParser.h"
+#include "WallpaperEngine/Data/Builders/VectorBuilder.h"
 #include "WallpaperEngine/Data/Model/DynamicValue.h"
 
+#include <cstdlib>
+#include <sstream>
+#include <string>
+
 using namespace WallpaperEngine::Data::Parsers;
+
+namespace {
+bool tokensAreNumeric (const std::string& str) {
+    std::istringstream in (str);
+    std::string token;
+    int count = 0;
+    while (in >> token) {
+	char* end = nullptr;
+	std::strtod (token.c_str (), &end);
+	if (end == token.c_str () || *end != '\0') {
+	    return false;
+	}
+	++count;
+    }
+    return count >= 2 && count <= 4;
+}
+} // namespace
 
 DynamicValueUniquePtr DynamicValueParser::parse (const json& data, const Properties& properties, bool expectColor) {
     auto value = std::make_unique<DynamicValue> ();
@@ -28,10 +50,18 @@ DynamicValueUniquePtr DynamicValueParser::parse (const json& data, const Propert
 	    value->update (Builders::ColorBuilder::parse (valueIt), DynamicValue::UpdateSource::Initialization);
 	} else {
 	    std::string str = valueIt;
-	    int size = Builders::VectorBuilder::preparseSize (str);
+	    // Space-separated text ("(    )", "I don't know WHAT...") is not a
+	    // vector. Only treat the string as vec2/3/4 when every token is numeric.
+	    const int size = Builders::VectorBuilder::preparseSize (str);
+	    const bool numericVector = size >= 2 && size <= 4 && tokensAreNumeric (str);
 
-	    if (size == 1) {
-		// scalar? text value?
+	    if (numericVector && size == 2) {
+		value->update (static_cast<glm::vec2> (valueIt), DynamicValue::UpdateSource::Initialization);
+	    } else if (numericVector && size == 3) {
+		value->update (static_cast<glm::vec3> (valueIt), DynamicValue::UpdateSource::Initialization);
+	    } else if (numericVector && size == 4) {
+		value->update (static_cast<glm::vec4> (valueIt), DynamicValue::UpdateSource::Initialization);
+	    } else if (size == 1) {
 		std::size_t parsed = 0;
 		try {
 		    float f = std::stof (str, &parsed);
@@ -44,12 +74,8 @@ DynamicValueUniquePtr DynamicValueParser::parse (const json& data, const Propert
 		} catch (const std::exception&) {
 		    value->update (str, DynamicValue::UpdateSource::Initialization);
 		}
-	    } else if (size == 2) {
-		value->update (static_cast<glm::vec2> (valueIt), DynamicValue::UpdateSource::Initialization);
-	    } else if (size == 3) {
-		value->update (static_cast<glm::vec3> (valueIt), DynamicValue::UpdateSource::Initialization);
 	    } else {
-		value->update (static_cast<glm::vec4> (valueIt), DynamicValue::UpdateSource::Initialization);
+		value->update (str, DynamicValue::UpdateSource::Initialization);
 	    }
 	}
     } else if (valueIt.is_number_integer ()) {
